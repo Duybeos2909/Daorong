@@ -1,0 +1,30 @@
+:root {
+  font-family: Inter, system-ui, Arial, sans-serif;
+  color: #f5f7fa;
+  background: #111827;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+#game-container {
+  width: 100vw;
+  height: 100vh;
+}
+
+canvas {
+  display: block;
+}
