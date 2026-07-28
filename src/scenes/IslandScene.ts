@@ -1,4 +1,8 @@
 import Phaser from "phaser";
+import {
+  BUILDING_DEFINITIONS,
+  getUpgradeCost,
+} from "../config/BuildingConfig";
 import { Dragon } from "../entities/Dragon";
 import {
   Building,
@@ -8,13 +12,35 @@ import {
   GridSystem,
   type GridPosition,
 } from "../systems/GridSystem";
+import { PlayerResources } from "../systems/PlayerResources";
+import { BuildingMenu } from "../ui/BuildingMenu";
 
 interface BuildingFootprint {
   cols: number;
   rows: number;
 }
 
+interface SavedBuildingData {
+  id: string;
+  type: BuildingType;
+  col: number;
+  row: number;
+  level: number;
+}
+
+interface SavedIslandData {
+  buildings: SavedBuildingData[];
+  dragonHabitatId?: string;
+}
+
 export class IslandScene extends Phaser.Scene {
+  private readonly saveKey = "dragon-island-save-v1";
+  private readonly resources =
+    new PlayerResources({
+      gold: 5000,
+      food: 1000,
+    });
+
   private readonly mapCols = 14;
   private readonly mapRows = 14;
 
@@ -26,6 +52,15 @@ export class IslandScene extends Phaser.Scene {
   );
 
   private dragon!: Dragon;
+  private buildingMenu!: BuildingMenu;
+  private buildingInfoPanel?: Phaser.GameObjects.Container;
+  private infoCloseButtonBounds?: Phaser.Geom.Rectangle;
+  private destroyConfirmPanel?: Phaser.GameObjects.Container;
+  private destroyCancelButtonBounds?: Phaser.Geom.Rectangle;
+  private destroyConfirmButtonBounds?: Phaser.Geom.Rectangle;
+  private modalBackdrop?: Phaser.GameObjects.Rectangle;
+  private infoReturnBuilding?: Building;
+  private destroyTargetBuilding?: Building;
 
   private selectedBuilding: BuildingType | null = null;
   private selectedPlacedBuilding?: Building;
@@ -38,6 +73,8 @@ export class IslandScene extends Phaser.Scene {
 
   private dragCandidate?: Building;
   private draggingBuilding?: Building;
+  private moveHintContainer?: Phaser.GameObjects.Container;
+  private buildingDragShadow?: Phaser.GameObjects.Ellipse;
 
   private dragPointerStart = new Phaser.Math.Vector2();
   private dragOriginalCol = 0;
@@ -51,6 +88,8 @@ export class IslandScene extends Phaser.Scene {
   private previousPointer = new Phaser.Math.Vector2();
 
   private actionText!: Phaser.GameObjects.Text;
+  private goldText!: Phaser.GameObjects.Text;
+  private foodText!: Phaser.GameObjects.Text;
 
   private handleGlobalKeyDown = (
     event: KeyboardEvent,
@@ -64,6 +103,26 @@ export class IslandScene extends Phaser.Scene {
 
     event.preventDefault();
     event.stopPropagation();
+
+    if (this.destroyConfirmPanel) {
+      this.closeDestroyConfirm(true);
+      return;
+    }
+
+    if (this.buildingInfoPanel) {
+      this.closeBuildingInfo(true);
+      return;
+    }
+
+    if (this.draggingBuilding) {
+      this.cancelBuildingDrag();
+      return;
+    }
+
+    if (this.buildingMenu?.isOpen()) {
+      this.buildingMenu.close();
+      return;
+    }
 
     if (this.selectedBuilding || this.placementPreview) {
       this.cancelBuildingPlacement();
@@ -84,6 +143,8 @@ export class IslandScene extends Phaser.Scene {
     this.drawIsland();
     this.createStartingObjects();
     this.createHud();
+    this.createResourceHud();
+    this.createBuildingMenu();
 
     this.setupKeyboardControls();
     this.setupCameraControls();
@@ -126,17 +187,516 @@ export class IslandScene extends Phaser.Scene {
   }
 
   private createStartingObjects(): void {
-    this.placeBuilding("house", 3, 3);
+    const dragonStart =
+      this.grid.gridToWorld(8, 8);
 
-    const habitat = this.placeBuilding("habitat", 7, 7);
+    this.dragon = new Dragon(
+      this,
+      dragonStart.x,
+      dragonStart.y - 12,
+    );
 
-    const start = this.grid.gridToWorld(8.5, 8.5);
+    const loaded = this.loadIsland();
 
-    this.dragon = new Dragon(this, start.x, start.y - 12);
+    if (loaded) {
+      return;
+    }
+
+    this.placeBuilding(
+      "house",
+      3,
+      3,
+      undefined,
+      false,
+    );
+
+    const habitat = this.placeBuilding(
+      "habitat",
+      7,
+      7,
+      undefined,
+      false,
+    );
 
     if (habitat) {
       this.assignDragonToHabitat(habitat);
     }
+
+    this.saveIsland();
+  }
+
+  private createBuildingMenu(): void {
+    this.buildingMenu = new BuildingMenu(
+      this,
+      {
+        onUpgrade: (building) => {
+          const upgradeCost = getUpgradeCost(
+            building.buildingType,
+            building.level,
+          );
+
+          if (
+            !this.resources.canAffordGold(
+              upgradeCost,
+            )
+          ) {
+            this.actionText.setText(
+              `Không đủ vàng nâng cấp. Cần ${upgradeCost.toLocaleString(
+                "vi-VN",
+              )} vàng`,
+            );
+
+            return;
+          }
+
+          this.resources.spendGold(
+            upgradeCost,
+          );
+
+          building.upgrade();
+
+          this.buildingMenu.refresh();
+          this.refreshResourceHud();
+          this.saveIsland();
+
+          this.actionText.setText(
+            `${building.getDisplayName()} lên cấp ${
+              building.level
+            } • -${upgradeCost.toLocaleString(
+              "vi-VN",
+            )} vàng`,
+          );
+        },
+
+        onInfo: (building) => {
+          this.showBuildingInfo(building);
+        },
+
+        onRemove: (building) => {
+          this.showDestroyConfirmation(building);
+        },
+      },
+    );
+  }
+
+  private createModalBackdrop(): void {
+    this.destroyModalBackdrop();
+
+    this.modalBackdrop = this.add.rectangle(
+      0,
+      0,
+      this.scale.width,
+      this.scale.height,
+      0x000000,
+      0.42,
+    );
+
+    this.modalBackdrop
+      .setOrigin(0)
+      .setScrollFactor(0)
+      .setDepth(299000)
+      .setInteractive();
+  }
+
+  private destroyModalBackdrop(): void {
+    if (!this.modalBackdrop) {
+      return;
+    }
+
+    this.modalBackdrop.destroy();
+    this.modalBackdrop = undefined;
+  }
+
+  private showBuildingInfo(
+    building: Building,
+  ): void {
+    this.closeDestroyConfirm(false);
+    this.closeBuildingInfo(false);
+
+    this.infoReturnBuilding = building;
+    this.buildingMenu.close();
+    this.createModalBackdrop();
+
+    const panel = this.add.container(
+      this.scale.width / 2,
+      this.scale.height / 2,
+    );
+
+    const screenCenterX = this.scale.width / 2;
+    const screenCenterY = this.scale.height / 2;
+
+    this.infoCloseButtonBounds =
+      new Phaser.Geom.Rectangle(
+        screenCenterX - 75,
+        screenCenterY + 84,
+        150,
+        42,
+      );
+
+    panel
+      .setScrollFactor(0)
+      .setDepth(300000);
+
+    const background = this.add.rectangle(
+      0,
+      0,
+      350,
+      290,
+      0x111827,
+      0.98,
+    );
+
+    background.setStrokeStyle(
+      3,
+      0xfacc15,
+      1,
+    );
+
+    const title = this.add
+      .text(0, -112, building.getDisplayName(), {
+        fontFamily: "Arial",
+        fontSize: "22px",
+        color: "#facc15",
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5);
+
+    const details = this.add
+      .text(
+        0,
+        -20,
+        [
+          `Cấp độ: ${building.level}`,
+          `Tọa độ: (${building.col}, ${building.row})`,
+          `Kích thước: ${building.cols} × ${building.rows}`,
+          `Diện tích: ${building.cols * building.rows} ô`,
+          `ID: ${building.id}`,
+        ],
+        {
+          fontFamily: "Arial",
+          fontSize: "16px",
+          color: "#ffffff",
+          align: "center",
+          lineSpacing: 9,
+        },
+      )
+      .setOrigin(0.5);
+
+    const closeBackground = this.add.rectangle(
+      0,
+      105,
+      150,
+      42,
+      0x2563eb,
+      1,
+    );
+
+    closeBackground
+      .setStrokeStyle(2, 0xffffff, 1)
+      .setInteractive({
+        useHandCursor: true,
+      });
+
+    const closeText = this.add
+      .text(0, 105, "Đóng", {
+        fontFamily: "Arial",
+        fontSize: "16px",
+        color: "#ffffff",
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5);
+
+    closeBackground.on(
+      "pointerup",
+      (
+        _pointer: Phaser.Input.Pointer,
+        _localX: number,
+        _localY: number,
+        event: Phaser.Types.Input.EventData,
+      ) => {
+        event.stopPropagation();
+
+        this.closeBuildingInfo(true);
+      },
+    );
+
+    panel.add([
+      background,
+      title,
+      details,
+      closeBackground,
+      closeText,
+    ]);
+
+    this.buildingInfoPanel = panel;
+  }
+
+  private closeBuildingInfo(
+    reopenMenu = false,
+  ): void {
+    const building = this.infoReturnBuilding;
+
+    if (this.buildingInfoPanel) {
+      this.buildingInfoPanel.destroy(true);
+      this.buildingInfoPanel = undefined;
+    }
+
+    this.infoCloseButtonBounds = undefined;
+    this.infoReturnBuilding = undefined;
+
+    if (!this.destroyConfirmPanel) {
+      this.destroyModalBackdrop();
+    }
+
+    if (
+      reopenMenu &&
+      building &&
+      building.active &&
+      this.buildings.includes(building)
+    ) {
+      this.selectPlacedBuilding(building);
+      this.buildingMenu.open(building);
+    }
+  }
+
+  private showDestroyConfirmation(
+    building: Building,
+  ): void {
+    this.closeBuildingInfo(false);
+    this.closeDestroyConfirm(false);
+
+    this.destroyTargetBuilding = building;
+
+    this.buildingMenu.close();
+    this.createModalBackdrop();
+
+    const panel = this.add.container(
+      this.scale.width / 2,
+      this.scale.height / 2,
+    );
+
+    const screenCenterX = this.scale.width / 2;
+    const screenCenterY = this.scale.height / 2;
+
+    this.destroyCancelButtonBounds =
+      new Phaser.Geom.Rectangle(
+        screenCenterX - 157.5,
+        screenCenterY + 49,
+        135,
+        42,
+      );
+
+    this.destroyConfirmButtonBounds =
+      new Phaser.Geom.Rectangle(
+        screenCenterX + 22.5,
+        screenCenterY + 49,
+        135,
+        42,
+      );
+
+    panel
+      .setScrollFactor(0)
+      .setDepth(300000);
+
+    const background = this.add.rectangle(
+      0,
+      0,
+      380,
+      235,
+      0x111827,
+      0.98,
+    );
+
+    background.setStrokeStyle(
+      3,
+      0xfacc15,
+      1,
+    );
+
+    const title = this.add
+      .text(0, -78, "Xác nhận phá bỏ?", {
+        fontFamily: "Arial",
+        fontSize: "22px",
+        color: "#facc15",
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5);
+
+    const message = this.add
+      .text(
+        0,
+        -18,
+        [
+          "Bạn có chắc muốn phá",
+          `${building.getDisplayName()} cấp ${building.level}?`,
+        ],
+        {
+          fontFamily: "Arial",
+          fontSize: "17px",
+          color: "#ffffff",
+          align: "center",
+          lineSpacing: 7,
+        },
+      )
+      .setOrigin(0.5);
+
+    const cancelButton = this.add.rectangle(
+      -90,
+      70,
+      135,
+      42,
+      0x2563eb,
+      1,
+    );
+
+    cancelButton
+      .setStrokeStyle(2, 0xffffff)
+      .setInteractive({
+        useHandCursor: true,
+      });
+
+    const cancelText = this.add
+      .text(-90, 70, "Hủy", {
+        fontFamily: "Arial",
+        fontSize: "16px",
+        color: "#ffffff",
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5);
+
+    const confirmButton = this.add.rectangle(
+      90,
+      70,
+      135,
+      42,
+      0xdc2626,
+      1,
+    );
+
+    confirmButton
+      .setStrokeStyle(2, 0xffffff)
+      .setInteractive({
+        useHandCursor: true,
+      });
+
+    const confirmText = this.add
+      .text(90, 70, "Phá bỏ", {
+        fontFamily: "Arial",
+        fontSize: "16px",
+        color: "#ffffff",
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5);
+
+    panel.add([
+      background,
+      title,
+      message,
+      cancelButton,
+      cancelText,
+      confirmButton,
+      confirmText,
+    ]);
+
+    this.destroyConfirmPanel = panel;
+  }
+
+  private closeDestroyConfirm(
+    reopenMenu = false,
+  ): void {
+    const building = this.destroyTargetBuilding;
+
+    if (this.destroyConfirmPanel) {
+      this.destroyConfirmPanel.destroy(true);
+      this.destroyConfirmPanel = undefined;
+    }
+
+    this.destroyCancelButtonBounds = undefined;
+    this.destroyConfirmButtonBounds = undefined;
+    this.destroyTargetBuilding = undefined;
+
+    if (!this.buildingInfoPanel) {
+      this.destroyModalBackdrop();
+    }
+
+    if (
+      reopenMenu &&
+      building &&
+      building.active &&
+      this.buildings.includes(building)
+    ) {
+      this.selectPlacedBuilding(building);
+      this.buildingMenu.open(building);
+    }
+  }
+
+  private removeBuilding(
+    building: Building,
+  ): void {
+    if (building.buildingType === "house") {
+      this.actionText.setText(
+        "Không thể phá Nhà chính",
+      );
+
+      return;
+    }
+
+    const buildingIndex =
+      this.buildings.indexOf(building);
+
+    if (buildingIndex === -1) {
+      return;
+    }
+
+    const buildingName =
+      building.getDisplayName();
+
+    const wasAssignedHabitat =
+      building.buildingType === "habitat" &&
+      this.dragon.habitatId === building.id;
+
+    this.buildings.splice(buildingIndex, 1);
+
+    this.buildingMenu.close();
+    this.clearBuildingSelection();
+
+    building.destroy();
+
+    if (wasAssignedHabitat) {
+      this.reassignDragonToAvailableHabitat();
+    }
+
+    this.saveIsland();
+
+    this.actionText.setText(
+      `${buildingName} đã bị phá bỏ`,
+    );
+  }
+
+  private reassignDragonToAvailableHabitat(): void {
+    const nextHabitat = this.buildings.find(
+      (building) =>
+        building.buildingType === "habitat",
+    );
+
+    if (nextHabitat) {
+      this.assignDragonToHabitat(nextHabitat);
+
+      this.dragon.setVisible(true);
+
+      this.actionText.setText(
+        `Rồng đã được chuyển sang ${nextHabitat.getDisplayName()}`,
+      );
+
+      return;
+    }
+
+    this.dragon.clearHabitat();
+    this.dragon.setVisible(false);
+
+    this.actionText.setText(
+      "Rồng đang được cất giữ vì chưa có Habitat",
+    );
   }
 
   private createHud(): void {
@@ -181,6 +741,7 @@ export class IslandScene extends Phaser.Scene {
         "Phím 2: chọn Nông trại",
         "Phím 3: chọn Habitat",
         "ESC: hủy chế độ xây dựng",
+        "Phím R: reset dữ liệu đảo",
       ],
       {
         fontFamily: "Arial",
@@ -211,6 +772,84 @@ export class IslandScene extends Phaser.Scene {
       .setDepth(100001);
   }
 
+  private createResourceHud(): void {
+    const panelWidth = 310;
+    const panelHeight = 58;
+
+    const panelX =
+      this.scale.width - panelWidth - 20;
+
+    const panelY = 20;
+
+    const panel = this.add.rectangle(
+      panelX,
+      panelY,
+      panelWidth,
+      panelHeight,
+      0x111827,
+      0.92,
+    );
+
+    panel
+      .setOrigin(0)
+      .setScrollFactor(0)
+      .setDepth(250000);
+
+    panel.setStrokeStyle(
+      2,
+      0xffffff,
+      0.3,
+    );
+
+    this.goldText = this.add.text(
+      panelX + 18,
+      panelY + 17,
+      "",
+      {
+        fontFamily: "Arial",
+        fontSize: "18px",
+        color: "#facc15",
+        fontStyle: "bold",
+      },
+    );
+
+    this.goldText
+      .setScrollFactor(0)
+      .setDepth(250001);
+
+    this.foodText = this.add.text(
+      panelX + 165,
+      panelY + 17,
+      "",
+      {
+        fontFamily: "Arial",
+        fontSize: "18px",
+        color: "#86efac",
+        fontStyle: "bold",
+      },
+    );
+
+    this.foodText
+      .setScrollFactor(0)
+      .setDepth(250001);
+
+    this.refreshResourceHud();
+  }
+
+  private refreshResourceHud(): void {
+    this.goldText.setText(
+      `Vàng: ${this.resources
+        .getGold()
+        .toLocaleString("vi-VN")}`,
+    );
+
+    this.foodText.setText(
+      `Thức ăn: ${this.resources
+        .getFood()
+        .toLocaleString("vi-VN")}`,
+    );
+  }
+
   private setupKeyboardControls(): void {
     const keyboard = this.input.keyboard;
 
@@ -239,14 +878,11 @@ export class IslandScene extends Phaser.Scene {
         this.selectBuilding("habitat");
       });
 
-      keyboard.on("keydown-ESC", () => {
-        if (this.selectedBuilding || this.placementPreview) {
-          this.cancelBuildingPlacement();
-          return;
-        }
-
-        this.clearBuildingSelection();
+      keyboard.on("keydown-R", () => {
+        localStorage.removeItem(this.saveKey);
+        window.location.reload();
       });
+
     }
 
     window.addEventListener(
@@ -324,6 +960,55 @@ export class IslandScene extends Phaser.Scene {
           return;
         }
 
+        /*
+         * Popup Chi tiết đang mở.
+         */
+        if (this.buildingInfoPanel) {
+          if (
+            this.infoCloseButtonBounds?.contains(
+              pointer.x,
+              pointer.y,
+            )
+          ) {
+            this.closeBuildingInfo(true);
+          }
+
+          return;
+        }
+
+        /*
+         * Popup xác nhận phá bỏ đang mở.
+         */
+        if (this.destroyConfirmPanel) {
+          if (
+            this.destroyCancelButtonBounds?.contains(
+              pointer.x,
+              pointer.y,
+            )
+          ) {
+            this.closeDestroyConfirm(true);
+            return;
+          }
+
+          if (
+            this.destroyConfirmButtonBounds?.contains(
+              pointer.x,
+              pointer.y,
+            )
+          ) {
+            const target =
+              this.destroyTargetBuilding;
+
+            this.closeDestroyConfirm(false);
+
+            if (target) {
+              this.removeBuilding(target);
+            }
+          }
+
+          return;
+        }
+
         if (
           pointer.x <= 330 &&
           pointer.y <= 200
@@ -355,13 +1040,11 @@ export class IslandScene extends Phaser.Scene {
               gridPosition.row,
             )
           ) {
-            this.placeBuilding(
+            this.tryBuildBuilding(
               this.selectedBuilding,
               gridPosition.col,
               gridPosition.row,
             );
-
-            this.clearPlacementArea();
           }
 
           return;
@@ -373,6 +1056,22 @@ export class IslandScene extends Phaser.Scene {
         );
 
         if (clickedBuilding) {
+          const clickedSelectedBuilding =
+            this.selectedPlacedBuilding ===
+            clickedBuilding;
+
+          if (
+            clickedSelectedBuilding &&
+            !this.buildingMenu.isOpen()
+          ) {
+            this.buildingMenu.open(clickedBuilding);
+
+            this.dragCandidate = undefined;
+            return;
+          }
+
+          this.buildingMenu.close();
+
           this.selectPlacedBuilding(clickedBuilding);
 
           this.dragCandidate = clickedBuilding;
@@ -381,7 +1080,9 @@ export class IslandScene extends Phaser.Scene {
           return;
         }
 
+        this.buildingMenu.close();
         this.dragCandidate = undefined;
+        this.buildingMenu.close();
         this.clearBuildingSelection();
       },
     );
@@ -408,6 +1109,13 @@ export class IslandScene extends Phaser.Scene {
     this.input.on(
       "pointerdown",
       (pointer: Phaser.Input.Pointer) => {
+        if (
+          this.buildingInfoPanel ||
+          this.destroyConfirmPanel
+        ) {
+          return;
+        }
+
         if (!pointer.rightButtonDown()) {
           return;
         }
@@ -476,9 +1184,142 @@ export class IslandScene extends Phaser.Scene {
     );
   }
 
+  private showBuildingMoveFeedback(
+    building: Building,
+  ): void {
+    this.hideBuildingMoveFeedback();
+
+    const shadow = this.add.ellipse(
+      building.x,
+      building.y + 10,
+      90,
+      28,
+      0x000000,
+      0.25,
+    );
+
+    shadow.setDepth(building.depth - 1);
+
+    const container = this.add.container(
+      building.x,
+      building.y,
+    );
+
+    const arrowStyle:
+      Phaser.Types.GameObjects.Text.TextStyle = {
+        fontFamily: "Arial",
+        fontSize: "28px",
+        color: "#ffffff",
+        fontStyle: "bold",
+        stroke: "#111827",
+        strokeThickness: 5,
+      };
+
+    const offsetX = 78;
+    const offsetY = 48;
+
+    const topLeft = this.add
+      .text(-offsetX, -offsetY, "◤", arrowStyle)
+      .setOrigin(0.5);
+
+    const topRight = this.add
+      .text(offsetX, -offsetY, "◥", arrowStyle)
+      .setOrigin(0.5);
+
+    const bottomLeft = this.add
+      .text(-offsetX, offsetY, "◣", arrowStyle)
+      .setOrigin(0.5);
+
+    const bottomRight = this.add
+      .text(offsetX, offsetY, "◢", arrowStyle)
+      .setOrigin(0.5);
+
+    container.add([
+      topLeft,
+      topRight,
+      bottomLeft,
+      bottomRight,
+    ]);
+    container.setDepth(building.depth + 100);
+
+    this.tweens.add({
+      targets: [
+        topLeft,
+        topRight,
+        bottomLeft,
+        bottomRight,
+      ],
+      alpha: {
+        from: 1,
+        to: 0.45,
+      },
+      scale: {
+        from: 1,
+        to: 1.12,
+      },
+      duration: 450,
+      yoyo: true,
+      repeat: -1,
+    });
+
+    this.moveHintContainer = container;
+    this.buildingDragShadow = shadow;
+
+    this.tweens.add({
+      targets: building,
+      scaleX: 1.06,
+      scaleY: 1.06,
+      duration: 140,
+      ease: "Sine.Out",
+    });
+  }
+
+  private updateBuildingMoveFeedback(
+    building: Building,
+  ): void {
+    if (this.moveHintContainer) {
+      this.moveHintContainer.setPosition(
+        building.x,
+        building.y,
+      );
+
+      this.moveHintContainer.setDepth(
+        building.depth + 100,
+      );
+    }
+
+    if (this.buildingDragShadow) {
+      this.buildingDragShadow.setPosition(
+        building.x,
+        building.y + 10,
+      );
+
+      this.buildingDragShadow.setDepth(
+        building.depth - 1,
+      );
+    }
+  }
+
+  private hideBuildingMoveFeedback(): void {
+    if (this.moveHintContainer) {
+      this.tweens.killTweensOf(
+        this.moveHintContainer.list,
+      );
+
+      this.moveHintContainer.destroy(true);
+      this.moveHintContainer = undefined;
+    }
+
+    if (this.buildingDragShadow) {
+      this.buildingDragShadow.destroy();
+      this.buildingDragShadow = undefined;
+    }
+  }
+
   private startBuildingDrag(
     building: Building,
   ): void {
+    this.buildingMenu.close();
     this.draggingBuilding = building;
 
     this.dragOriginalCol = building.col;
@@ -487,7 +1328,9 @@ export class IslandScene extends Phaser.Scene {
     this.dragPreviewCol = building.col;
     this.dragPreviewRow = building.row;
 
-    building.setAlpha(0.7);
+    building.setAlpha(0.78);
+
+    this.showBuildingMoveFeedback(building);
 
     this.input.setDefaultCursor("grabbing");
 
@@ -532,6 +1375,10 @@ export class IslandScene extends Phaser.Scene {
     );
 
     this.draggingBuilding.setDepth(center.y + 500);
+
+    this.updateBuildingMoveFeedback(
+      this.draggingBuilding,
+    );
 
     const canMove = this.canPlaceBuilding(
       this.draggingBuilding.buildingType,
@@ -589,7 +1436,19 @@ export class IslandScene extends Phaser.Scene {
       center.y - 36,
     );
 
-    building.setAlpha(1).setTint(0xffd54f);
+    this.hideBuildingMoveFeedback();
+
+    building.setAlpha(1);
+
+    this.tweens.add({
+      targets: building,
+      scaleX: 1,
+      scaleY: 1,
+      duration: 220,
+      ease: "Bounce.Out",
+    });
+
+    building.setTint(0xffd54f);
 
     this.draggingBuilding = undefined;
 
@@ -609,6 +1468,8 @@ export class IslandScene extends Phaser.Scene {
         this.getHabitatRoamingPoints(building),
       );
     }
+
+    this.saveIsland();
   }
 
   private selectBuilding(type: BuildingType): void {
@@ -633,15 +1494,13 @@ export class IslandScene extends Phaser.Scene {
 
     this.input.setDefaultCursor("crosshair");
 
-    const buildingName =
-      type === "house"
-        ? "Nhà chính"
-        : type === "farm"
-          ? "Nông trại"
-          : "Habitat";
+    const definition =
+      BUILDING_DEFINITIONS[type];
 
     this.actionText.setText(
-      `Trạng thái: Đang đặt ${buildingName}`,
+      `Đang đặt ${definition.displayName} • Giá ${definition.buildCost.toLocaleString(
+        "vi-VN",
+      )} vàng`,
     );
   }
 
@@ -711,6 +1570,11 @@ export class IslandScene extends Phaser.Scene {
     type: BuildingType,
     col: number,
     row: number,
+    savedData?: {
+      id?: string;
+      level?: number;
+    },
+    shouldSave = true,
   ): Building | null {
     if (!this.canPlaceBuilding(type, col, row)) {
       return null;
@@ -735,19 +1599,161 @@ export class IslandScene extends Phaser.Scene {
       center.x,
       center.y - 36,
       {
+        id: savedData?.id,
         type,
         col,
         row,
         cols: footprint.cols,
         rows: footprint.rows,
         texture,
-        level: 1,
+        level: savedData?.level ?? 1,
       },
     );
 
     this.buildings.push(building);
 
+    if (
+      type === "habitat" &&
+      this.dragon &&
+      !this.dragon.habitatId
+    ) {
+      this.dragon.setVisible(true);
+      this.assignDragonToHabitat(building);
+    }
+
+    if (shouldSave) {
+      this.saveIsland();
+    }
+
     return building;
+  }
+
+  private tryBuildBuilding(
+    type: BuildingType,
+    col: number,
+    row: number,
+  ): void {
+    const definition =
+      BUILDING_DEFINITIONS[type];
+
+    if (
+      !this.resources.canAffordGold(
+        definition.buildCost,
+      )
+    ) {
+      this.actionText.setText(
+        `Không đủ vàng. Cần ${definition.buildCost.toLocaleString(
+          "vi-VN",
+        )} vàng`,
+      );
+
+      return;
+    }
+
+    const building = this.placeBuilding(
+      type,
+      col,
+      row,
+    );
+
+    if (!building) {
+      return;
+    }
+
+    this.resources.spendGold(
+      definition.buildCost,
+    );
+
+    this.refreshResourceHud();
+    this.clearPlacementArea();
+
+    this.actionText.setText(
+      `Đã xây ${definition.displayName} -${definition.buildCost.toLocaleString(
+        "vi-VN",
+      )} vàng`,
+    );
+  }
+
+  private saveIsland(): void {
+    const data: SavedIslandData = {
+      buildings: this.buildings.map((building) => ({
+        id: building.id,
+        type: building.buildingType,
+        col: building.col,
+        row: building.row,
+        level: building.level,
+      })),
+
+      dragonHabitatId: this.dragon?.habitatId,
+    };
+
+    localStorage.setItem(
+      this.saveKey,
+      JSON.stringify(data),
+    );
+  }
+
+  private loadIsland(): boolean {
+    const rawData = localStorage.getItem(
+      this.saveKey,
+    );
+
+    if (!rawData) {
+      return false;
+    }
+
+    try {
+      const data = JSON.parse(
+        rawData,
+      ) as SavedIslandData;
+
+      if (!Array.isArray(data.buildings)) {
+        return false;
+      }
+
+      for (const savedBuilding of data.buildings) {
+        this.placeBuilding(
+          savedBuilding.type,
+          savedBuilding.col,
+          savedBuilding.row,
+          {
+            id: savedBuilding.id,
+            level: savedBuilding.level,
+          },
+          false,
+        );
+      }
+
+      const assignedHabitat =
+        this.buildings.find(
+          (building) =>
+            building.buildingType === "habitat" &&
+            building.id === data.dragonHabitatId,
+        ) ??
+        this.buildings.find(
+          (building) =>
+            building.buildingType === "habitat",
+        );
+
+      if (assignedHabitat) {
+        this.dragon.setVisible(true);
+        this.assignDragonToHabitat(
+          assignedHabitat,
+        );
+      } else {
+        this.dragon.clearHabitat();
+        this.dragon.setVisible(false);
+      }
+
+      return true;
+    } catch (error) {
+      console.error(
+        "Không thể tải dữ liệu đảo:",
+        error,
+      );
+
+      return false;
+    }
   }
 
   private canPlaceBuilding(
@@ -957,6 +1963,8 @@ export class IslandScene extends Phaser.Scene {
     this.selectedBuilding = null;
     this.clearBuildingSelection();
 
+    this.hideBuildingMoveFeedback();
+
     if (this.placementPreview) {
       this.placementPreview.destroy();
       this.placementPreview = undefined;
@@ -1049,6 +2057,43 @@ export class IslandScene extends Phaser.Scene {
     graphics.setDepth(building.depth + 1);
 
     this.buildingSelectionGraphics = graphics;
+  }
+
+  private cancelBuildingDrag(): void {
+    const building = this.draggingBuilding;
+
+    if (!building) {
+      return;
+    }
+
+    const center = this.getBuildingWorldCenter(
+      this.dragOriginalCol,
+      this.dragOriginalRow,
+      {
+        cols: building.cols,
+        rows: building.rows,
+      },
+    );
+
+    building.moveToGrid(
+      this.dragOriginalCol,
+      this.dragOriginalRow,
+      center.x,
+      center.y - 36,
+    );
+
+    building
+      .setAlpha(1)
+      .setScale(1)
+      .setTint(0xffd54f);
+
+    this.draggingBuilding = undefined;
+    this.dragCandidate = undefined;
+
+    this.hideBuildingMoveFeedback();
+    this.drawBuildingSelection(building);
+
+    this.input.setDefaultCursor("default");
   }
 
   private clearBuildingSelection(): void {
