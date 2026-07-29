@@ -1,4 +1,9 @@
 import Phaser from "phaser";
+import {
+  getFarmConstructionDuration,
+  getFarmFoodReward,
+  getFarmProductionDuration,
+} from "../config/BuildingConfig";
 
 export type BuildingType =
   | "house"
@@ -16,6 +21,9 @@ export interface BuildingConfig {
 
   level?: number;
   texture: string;
+
+  constructionStartedAt?: number;
+  productionStartedAt?: number;
 }
 
 export class Building extends Phaser.GameObjects.Image {
@@ -29,6 +37,11 @@ export class Building extends Phaser.GameObjects.Image {
   public readonly rows: number;
 
   public level: number;
+  public constructionStartedAt: number;
+  public productionStartedAt: number;
+
+  private constructionLabel?: Phaser.GameObjects.Text;
+  private harvestIcon?: Phaser.GameObjects.Text;
 
   constructor(
     scene: Phaser.Scene,
@@ -56,6 +69,16 @@ export class Building extends Phaser.GameObjects.Image {
     this.rows = config.rows;
 
     this.level = config.level ?? 1;
+
+    const currentTime = Date.now();
+
+    this.constructionStartedAt =
+      config.constructionStartedAt ??
+      currentTime;
+
+    this.productionStartedAt =
+      config.productionStartedAt ??
+      0;
 
     this.setDepth(y + 500);
   }
@@ -107,6 +130,8 @@ export class Building extends Phaser.GameObjects.Image {
 
     this.setPosition(worldX, worldY);
     this.setDepth(worldY + 500);
+
+    this.updateFarmIndicatorPosition();
   }
 
   public upgrade(): void {
@@ -124,5 +149,320 @@ export class Building extends Phaser.GameObjects.Image {
       case "habitat":
         return "Môi trường sống";
     }
+  }
+
+  public isFarm(): boolean {
+    return this.buildingType === "farm";
+  }
+
+  public getConstructionDuration(): number {
+    if (!this.isFarm()) {
+      return 0;
+    }
+
+    return getFarmConstructionDuration(
+      this.level,
+    );
+  }
+
+  public isConstructionComplete(
+    currentTime = Date.now(),
+  ): boolean {
+    if (!this.isFarm()) {
+      return true;
+    }
+
+    return (
+      currentTime -
+        this.constructionStartedAt >=
+      this.getConstructionDuration()
+    );
+  }
+
+  public getRemainingConstructionTime(
+    currentTime = Date.now(),
+  ): number {
+    if (!this.isFarm()) {
+      return 0;
+    }
+
+    return Math.max(
+      0,
+      this.getConstructionDuration() -
+        (currentTime -
+          this.constructionStartedAt),
+    );
+  }
+
+  public ensureProductionStarted(
+    currentTime = Date.now(),
+  ): void {
+    if (
+      !this.isFarm() ||
+      !this.isConstructionComplete(
+        currentTime,
+      )
+    ) {
+      return;
+    }
+
+    if (this.productionStartedAt > 0) {
+      return;
+    }
+
+    this.productionStartedAt =
+      currentTime;
+  }
+
+  public getProductionDuration(): number {
+    if (!this.isFarm()) {
+      return 0;
+    }
+
+    return getFarmProductionDuration(
+      this.level,
+    );
+  }
+
+  public getFoodReward(): number {
+    if (!this.isFarm()) {
+      return 0;
+    }
+
+    return getFarmFoodReward(
+      this.level,
+    );
+  }
+
+  public isReadyToHarvest(
+    currentTime = Date.now(),
+  ): boolean {
+    if (
+      !this.isFarm() ||
+      !this.isConstructionComplete(
+        currentTime,
+      )
+    ) {
+      return false;
+    }
+
+    this.ensureProductionStarted(
+      currentTime,
+    );
+
+    return (
+      currentTime -
+        this.productionStartedAt >=
+      this.getProductionDuration()
+    );
+  }
+
+  public getRemainingProductionTime(
+    currentTime = Date.now(),
+  ): number {
+    if (
+      !this.isFarm() ||
+      !this.isConstructionComplete(
+        currentTime,
+      )
+    ) {
+      return 0;
+    }
+
+    this.ensureProductionStarted(
+      currentTime,
+    );
+
+    return Math.max(
+      0,
+      this.getProductionDuration() -
+        (currentTime -
+          this.productionStartedAt),
+    );
+  }
+
+  public restartProduction(): void {
+    if (
+      !this.isFarm() ||
+      !this.isConstructionComplete()
+    ) {
+      return;
+    }
+
+    this.productionStartedAt =
+      Date.now();
+
+    this.hideHarvestIcon();
+  }
+
+  public beginFarmUpgrade(): void {
+    if (!this.isFarm()) {
+      return;
+    }
+
+    this.constructionStartedAt =
+      Date.now();
+
+    this.productionStartedAt = 0;
+
+    this.hideHarvestIcon();
+    this.hideConstructionLabel();
+  }
+
+  public showConstructionLabel(
+    remainingMilliseconds: number,
+  ): void {
+    const seconds = Math.ceil(
+      remainingMilliseconds / 1000,
+    );
+
+    if (!this.constructionLabel) {
+      this.constructionLabel = this.scene.add
+        .text(
+          this.x,
+          this.y - 90,
+          "",
+          {
+            fontFamily: "Arial",
+            fontSize: "18px",
+            color: "#ffffff",
+            backgroundColor: "#111827",
+            padding: {
+              x: 8,
+              y: 5,
+            },
+          },
+        )
+        .setOrigin(0.5)
+        .setDepth(this.depth + 200);
+    }
+
+    this.constructionLabel
+      .setText(`🔨 ${seconds}s`)
+      .setPosition(
+        this.x,
+        this.y - 90,
+      )
+      .setDepth(this.depth + 200);
+  }
+
+  public hideConstructionLabel(): void {
+    if (!this.constructionLabel) {
+      return;
+    }
+
+    this.constructionLabel.destroy();
+    this.constructionLabel =
+      undefined;
+  }
+
+  public showHarvestIcon(): void {
+    if (!this.isFarm() || this.harvestIcon) {
+      return;
+    }
+
+    this.harvestIcon = this.scene.add
+      .text(this.x, this.y - 95, "🌾", {
+        fontFamily: "Arial",
+        fontSize: "34px",
+        backgroundColor: "#ffffff",
+        padding: {
+          x: 7,
+          y: 4,
+        },
+      })
+      .setOrigin(0.5)
+      .setDepth(this.depth + 200);
+
+    this.scene.tweens.add({
+      targets: this.harvestIcon,
+      y: this.harvestIcon.y - 10,
+      duration: 550,
+      ease: "Sine.InOut",
+      yoyo: true,
+      repeat: -1,
+    });
+  }
+
+  public hideHarvestIcon(): void {
+    if (!this.harvestIcon) {
+      return;
+    }
+
+    this.scene.tweens.killTweensOf(
+      this.harvestIcon,
+    );
+
+    this.harvestIcon.destroy();
+    this.harvestIcon = undefined;
+  }
+
+  public updateFarmProduction(
+    currentTime = Date.now(),
+  ): void {
+    if (!this.isFarm()) {
+      return;
+    }
+
+    if (
+      !this.isConstructionComplete(
+        currentTime,
+      )
+    ) {
+      this.hideHarvestIcon();
+
+      this.showConstructionLabel(
+        this.getRemainingConstructionTime(
+          currentTime,
+        ),
+      );
+
+      return;
+    }
+
+    this.hideConstructionLabel();
+
+    this.ensureProductionStarted(
+      currentTime,
+    );
+
+    if (
+      this.isReadyToHarvest(
+        currentTime,
+      )
+    ) {
+      this.showHarvestIcon();
+    } else {
+      this.hideHarvestIcon();
+    }
+  }
+
+  public updateFarmIndicatorPosition(): void {
+    if (this.harvestIcon) {
+      this.harvestIcon
+        .setPosition(
+          this.x,
+          this.y - 95,
+        )
+        .setDepth(this.depth + 200);
+    }
+
+    if (this.constructionLabel) {
+      this.constructionLabel
+        .setPosition(
+          this.x,
+          this.y - 90,
+        )
+        .setDepth(this.depth + 200);
+    }
+  }
+
+  public destroy(
+    fromScene?: boolean,
+  ): void {
+    this.hideHarvestIcon();
+    this.hideConstructionLabel();
+
+    super.destroy(fromScene);
   }
 }

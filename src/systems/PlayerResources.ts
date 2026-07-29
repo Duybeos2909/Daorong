@@ -58,6 +58,24 @@ export class PlayerResources {
     return true;
   }
 
+  public setState(
+    state: Partial<PlayerResourceState>,
+  ): void {
+    if (
+      typeof state.gold === "number" &&
+      state.gold >= 0
+    ) {
+      this.gold = state.gold;
+    }
+
+    if (
+      typeof state.food === "number" &&
+      state.food >= 0
+    ) {
+      this.food = state.food;
+    }
+  }
+
   public getState(): PlayerResourceState {
     return {
       gold: this.gold,

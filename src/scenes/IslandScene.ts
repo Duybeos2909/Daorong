@@ -1,6 +1,7 @@
 import Phaser from "phaser";
 import {
   BUILDING_DEFINITIONS,
+  getFarmBuildCost,
   getUpgradeCost,
 } from "../config/BuildingConfig";
 import { Dragon } from "../entities/Dragon";
@@ -26,11 +27,16 @@ interface SavedBuildingData {
   col: number;
   row: number;
   level: number;
+
+  constructionStartedAt?: number;
+  productionStartedAt?: number;
 }
 
 interface SavedIslandData {
   buildings: SavedBuildingData[];
   dragonHabitatId?: string;
+  gold?: number;
+  food?: number;
 }
 
 export class IslandScene extends Phaser.Scene {
@@ -154,8 +160,19 @@ export class IslandScene extends Phaser.Scene {
     this.cameras.main.setZoom(1);
   }
 
-  update(time: number, delta: number): void {
+  update(
+    time: number,
+    delta: number,
+  ): void {
     this.dragon.update(time, delta);
+
+    const currentTime = Date.now();
+
+    for (const building of this.buildings) {
+      building.updateFarmProduction(
+        currentTime,
+      );
+    }
   }
 
   private drawOcean(): void {
@@ -230,10 +247,11 @@ export class IslandScene extends Phaser.Scene {
       this,
       {
         onUpgrade: (building) => {
-          const upgradeCost = getUpgradeCost(
-            building.buildingType,
-            building.level,
-          );
+          const upgradeCost =
+            getUpgradeCost(
+              building.buildingType,
+              building.level,
+            );
 
           if (
             !this.resources.canAffordGold(
@@ -241,7 +259,7 @@ export class IslandScene extends Phaser.Scene {
             )
           ) {
             this.actionText.setText(
-              `Không đủ vàng nâng cấp. Cần ${upgradeCost.toLocaleString(
+              `Không đủ vàng. Cần ${upgradeCost.toLocaleString(
                 "vi-VN",
               )} vàng`,
             );
@@ -255,17 +273,33 @@ export class IslandScene extends Phaser.Scene {
 
           building.upgrade();
 
+          if (
+            building.buildingType === "farm"
+          ) {
+            building.beginFarmUpgrade();
+          }
+
           this.buildingMenu.refresh();
           this.refreshResourceHud();
           this.saveIsland();
 
-          this.actionText.setText(
-            `${building.getDisplayName()} lên cấp ${
-              building.level
-            } • -${upgradeCost.toLocaleString(
-              "vi-VN",
-            )} vàng`,
-          );
+          const constructionSeconds =
+            building.buildingType === "farm"
+              ? building.getConstructionDuration() /
+                1000
+              : 0;
+
+          if (
+            building.buildingType === "farm"
+          ) {
+            this.actionText.setText(
+              `Đang nâng Nông trại lên cấp ${building.level} • Hoàn tất sau ${constructionSeconds} giây`,
+            );
+          } else {
+            this.actionText.setText(
+              `${building.getDisplayName()} đã lên cấp ${building.level}`,
+            );
+          }
         },
 
         onInfo: (building) => {
@@ -1056,6 +1090,13 @@ export class IslandScene extends Phaser.Scene {
         );
 
         if (clickedBuilding) {
+          if (this.tryHarvestFarm(clickedBuilding)) {
+            this.buildingMenu.close();
+            this.dragCandidate = undefined;
+            this.clearBuildingSelection();
+            return;
+          }
+
           const clickedSelectedBuilding =
             this.selectedPlacedBuilding ===
             clickedBuilding;
@@ -1573,6 +1614,8 @@ export class IslandScene extends Phaser.Scene {
     savedData?: {
       id?: string;
       level?: number;
+      constructionStartedAt?: number;
+      productionStartedAt?: number;
     },
     shouldSave = true,
   ): Building | null {
@@ -1607,6 +1650,12 @@ export class IslandScene extends Phaser.Scene {
         rows: footprint.rows,
         texture,
         level: savedData?.level ?? 1,
+
+        constructionStartedAt:
+          savedData?.constructionStartedAt,
+
+        productionStartedAt:
+          savedData?.productionStartedAt,
       },
     );
 
@@ -1636,13 +1685,19 @@ export class IslandScene extends Phaser.Scene {
     const definition =
       BUILDING_DEFINITIONS[type];
 
+    const buildCost =
+      type === "farm"
+        ? getFarmBuildCost(1)
+        : BUILDING_DEFINITIONS[type]
+            .buildCost;
+
     if (
       !this.resources.canAffordGold(
-        definition.buildCost,
+        buildCost,
       )
     ) {
       this.actionText.setText(
-        `Không đủ vàng. Cần ${definition.buildCost.toLocaleString(
+        `Không đủ vàng. Cần ${buildCost.toLocaleString(
           "vi-VN",
         )} vàng`,
       );
@@ -1654,6 +1709,8 @@ export class IslandScene extends Phaser.Scene {
       type,
       col,
       row,
+      undefined,
+      false,
     );
 
     if (!building) {
@@ -1661,20 +1718,84 @@ export class IslandScene extends Phaser.Scene {
     }
 
     this.resources.spendGold(
-      definition.buildCost,
+      buildCost,
     );
 
     this.refreshResourceHud();
     this.clearPlacementArea();
+    this.saveIsland();
 
     this.actionText.setText(
-      `Đã xây ${definition.displayName} -${definition.buildCost.toLocaleString(
-        "vi-VN",
-      )} vàng`,
+      type === "farm"
+        ? "Đang xây Nông trại cấp 1 • Hoàn tất sau 30 giây"
+        : `Đã xây ${definition.displayName}`,
     );
   }
 
+  private tryHarvestFarm(
+    building: Building,
+  ): boolean {
+    if (
+      building.buildingType !== "farm"
+    ) {
+      return false;
+    }
+
+    if (
+      !building.isConstructionComplete()
+    ) {
+      const remainingSeconds =
+        Math.ceil(
+          building.getRemainingConstructionTime() /
+            1000,
+        );
+
+      this.actionText.setText(
+        `Nông trại đang xây • Còn ${remainingSeconds} giây`,
+      );
+
+      return true;
+    }
+
+    if (
+      !building.isReadyToHarvest()
+    ) {
+      const remainingSeconds =
+        Math.ceil(
+          building.getRemainingProductionTime() /
+            1000,
+        );
+
+      this.actionText.setText(
+        `Nông trại đang sản xuất • Còn ${remainingSeconds} giây`,
+      );
+
+      return true;
+    }
+
+    const reward =
+      building.getFoodReward();
+
+    this.resources.addFood(reward);
+
+    building.restartProduction();
+
+    this.refreshResourceHud();
+    this.saveIsland();
+
+    this.actionText.setText(
+      `Đã thu hoạch ${reward.toLocaleString(
+        "vi-VN",
+      )} thức ăn`,
+    );
+
+    return true;
+  }
+
   private saveIsland(): void {
+    const resourceState =
+      this.resources.getState();
+
     const data: SavedIslandData = {
       buildings: this.buildings.map((building) => ({
         id: building.id,
@@ -1682,9 +1803,18 @@ export class IslandScene extends Phaser.Scene {
         col: building.col,
         row: building.row,
         level: building.level,
+
+        constructionStartedAt:
+          building.constructionStartedAt,
+
+        productionStartedAt:
+          building.productionStartedAt,
       })),
 
       dragonHabitatId: this.dragon?.habitatId,
+
+      gold: resourceState.gold,
+      food: resourceState.food,
     };
 
     localStorage.setItem(
@@ -1711,6 +1841,11 @@ export class IslandScene extends Phaser.Scene {
         return false;
       }
 
+      this.resources.setState({
+        gold: data.gold,
+        food: data.food,
+      });
+
       for (const savedBuilding of data.buildings) {
         this.placeBuilding(
           savedBuilding.type,
@@ -1719,6 +1854,12 @@ export class IslandScene extends Phaser.Scene {
           {
             id: savedBuilding.id,
             level: savedBuilding.level,
+
+            constructionStartedAt:
+              savedBuilding.constructionStartedAt,
+
+            productionStartedAt:
+              savedBuilding.productionStartedAt,
           },
           false,
         );
@@ -2000,6 +2141,25 @@ export class IslandScene extends Phaser.Scene {
     building.setTint(0xffd54f);
 
     this.drawBuildingSelection(building);
+
+    if (building.buildingType === "farm") {
+      if (building.isReadyToHarvest()) {
+        this.actionText.setText(
+          `Nông trại cấp ${building.level} • Sẵn sàng thu hoạch`,
+        );
+      } else {
+        const remainingSeconds = Math.ceil(
+          building.getRemainingProductionTime() /
+            1000,
+        );
+
+        this.actionText.setText(
+          `Nông trại cấp ${building.level} • Còn ${remainingSeconds} giây`,
+        );
+      }
+
+      return;
+    }
 
     this.actionText.setText(
       `Đã chọn: ${building.getDisplayName()} - Cấp ${building.level}`,
